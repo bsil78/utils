@@ -1,11 +1,18 @@
 package bsil78.utils;
 
 
-import com.google.gson.*;
+import com.google.gson.GsonBuilder;
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
+import com.google.gson.TypeAdapter;
 import com.google.gson.stream.JsonReader;
 import com.google.gson.stream.JsonWriter;
+import com.jayway.jsonpath.Configuration;
 import com.jayway.jsonpath.DocumentContext;
 import com.jayway.jsonpath.JsonPath;
+import com.jayway.jsonpath.TypeRef;
+import com.jayway.jsonpath.spi.json.GsonJsonProvider;
+import com.jayway.jsonpath.spi.mapper.GsonMappingProvider;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.commons.lang3.exception.ExceptionUtils;
 
@@ -14,6 +21,7 @@ import java.io.Serializable;
 import java.lang.reflect.Modifier;
 import java.util.*;
 import java.util.function.Function;
+import java.util.stream.Collectors;
 
 import static java.util.Objects.requireNonNull;
 
@@ -31,10 +39,12 @@ public final class JsonResponse implements Serializable {
 
     static {
         forceJavaVersionProperty();
-        gsonBuilder=new GsonBuilder().disableInnerClassSerialization()
-                         .excludeFieldsWithModifiers(Modifier.STATIC,
-                                                     Modifier.TRANSIENT,
-                                                     Modifier.VOLATILE);
+        gsonBuilder=new GsonBuilder()
+                        .enableComplexMapKeySerialization()
+                        .serializeNulls()
+                        .excludeFieldsWithModifiers(Modifier.STATIC,
+                                                    Modifier.TRANSIENT,
+                                                    Modifier.VOLATILE);
 
 
     }
@@ -65,7 +75,9 @@ public final class JsonResponse implements Serializable {
         return Optional.ofNullable(toJsonify)
                        .map(value -> {
                            forceJavaVersionProperty();
-                           return gsonBuilder.create().toJson(toJsonify);
+                           final String json=gsonBuilder.create().toJson(toJsonify);
+                           if("null".equals(json)) throw new CannotConvertToJson(toJsonify);
+                           return json;
                        })
                        .orElse("");
     }
@@ -148,7 +160,40 @@ public final class JsonResponse implements Serializable {
 
     public Optional<String> jsonStringValue(final String path) {
         enforceLineSeparator();
-        return Optional.ofNullable(jsonPathContext().read(path)).map(Object::toString);
+        return Optional.ofNullable(jsonPathContext().read(path))
+                       .map(Object::toString)
+                       .filter(JsonResponse::notNullValue)
+                       .map(JsonResponse::removeStringMarks);
+    }
+
+    private static boolean notNullValue(final String value) {
+        return !"null".equals(value);
+    }
+
+    private static String removeStringMarks(final String value) {
+        return value!=null && (value.startsWith("\"") && value.endsWith("\""))
+                   ?value.substring(1, value.length()-1)
+                   :value;
+    }
+
+    public List<String> jsonStringValues(final String path) {
+        enforceLineSeparator();
+        return jsonPathContext().read(path, new ListTypeRef())
+                                .stream()
+                                .map(JsonResponse::removeStringMarks)
+                                .collect(Collectors.toList());
+    }
+
+    public Map<String,String> jsonStringsMap(final String path) {
+        enforceLineSeparator();
+        return jsonPathContext().read(path.endsWith("*")?path:path+"*", new MapTypeRef())
+                                .entrySet()
+                                .stream()
+                                .map(entry->new Object(){
+                                    private final String key= JsonResponse.removeStringMarks(entry.getKey());
+                                    private final String value = JsonResponse.removeStringMarks(entry.getValue());
+                                })
+                                .collect(Collectors.toMap(obj->obj.key, obj -> obj.value));
     }
 
     // logback core bug workaround with line separator...
@@ -159,7 +204,8 @@ public final class JsonResponse implements Serializable {
     }
 
     private DocumentContext jsonPathContext() {
-        if(jsonPathContext==null) jsonPathContext=JsonPath.parse(jsonContent());
+        if(jsonPathContext==null) jsonPathContext=JsonPath.parse(jsonContent(),
+                                                                 Configuration.builder().jsonProvider(new GsonJsonProvider()).mappingProvider(new GsonMappingProvider()).build());
         return jsonPathContext;
     }
 
@@ -210,6 +256,27 @@ public final class JsonResponse implements Serializable {
         @Override
         public T read(final JsonReader in) {
             throw new UnsupportedOperationException("One must not read json with this type adapter");
+        }
+    }
+
+    private static class ListTypeRef extends TypeRef<List< String>> {
+    }
+
+    private static class MapTypeRef extends  TypeRef<Map<String,String>>{
+    }
+
+    public static class CannotConvertToJson extends RuntimeException {
+        public CannotConvertToJson(final Object toJsonify) {
+            super(tryFindRotCause(toJsonify));
+        }
+
+        private static String tryFindRotCause(final Object toJsonify) {
+            final String simpleName = toJsonify.getClass().getSimpleName();
+            if(simpleName.isEmpty())
+                return "Cannot convert an anonymous class instance to json : "+toJsonify.getClass().getName();
+            if(toJsonify.getClass().getCanonicalName()==null)
+                return "Cannot convert a scope limited object to json : " + toJsonify.getClass().getName();
+            return "Cannot convert the given object to json : " + toJsonify.getClass().getCanonicalName();
         }
     }
 }
